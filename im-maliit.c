@@ -284,7 +284,6 @@ static void context_method_call(GDBusConnection *conn, const gchar *sender,
 {
     ImMaliit *self = focused_context;
 
-
     if (!g_strcmp0(method, "commitString")) {
         const gchar *text = NULL;
         gint rs, rl, cp;
@@ -565,8 +564,6 @@ static void im_maliit_gesture_released(GtkGestureClick *gesture, gint n_press,
     (void)x;
     (void)y;
     (void)user_data;
-    g_print("im-maliit: reopen-gesture released, focused_context=%p\n",
-           (void *)focused_context);
     if (!focused_context)
         return;
     if (!ensure_connection())
@@ -707,9 +704,6 @@ static void im_maliit_init(ImMaliit *self)
  * implements the extension point with its GtkIMContext subclass; loading is
  * triggered by pointing GTK_PATH at the tree holding 4.0.0/immodules/ and
  * setting GTK_IM_MODULE=maliit. */
-
-static void im_maliit_class_init(ImMaliitClass *klass);
-static void im_maliit_init(ImMaliit *self);
 
 G_MODULE_EXPORT void g_io_module_load(GIOModule *module)
 {
