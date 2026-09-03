@@ -1,8 +1,10 @@
-# im-maliit — a GTK3 input method module for Maliit
+# im-maliit — a GTK4 input method module for Maliit
 
-**Lets GTK applications use Ubuntu Touch's on-screen keyboard.**
+**Lets GTK4 applications use Ubuntu Touch's on-screen keyboard.**
 
-Without this, they cannot. Ubuntu Touch ships a Maliit input context for **Qt
+This is a GTK4 port of [gtk-im-maliit](https://github.com/TheSittingPenguin96/gtk-im-maliit)
+(the original GTK3 module). Without such a module, GTK apps cannot use the
+keyboard on Ubuntu Touch: it ships a Maliit input context for **Qt
 only**, and Mir advertises **no text-input Wayland protocol**, so GTK's
 `im-wayland.so` has nothing to talk to either. Lomiri's session even sets
 `GTK_IM_MODULE=maliit` — naming a GTK module that does not exist on the device.
@@ -14,20 +16,24 @@ well they otherwise run.
 This module speaks Maliit's D-Bus protocol directly, the same way the Qt plugin
 does, so it works on Wayland and through XWayland alike.
 
+## Provenance
+
+This repo is vibecoded slop, based on the (also vibecoded)
+[gtk-im-maliit](https://github.com/TheSittingPenguin96/gtk-im-maliit) (GTK3),
+itself derived from the [uFirefox](https://gitlab.com/debclick/uFirefox/) hack.
+
+Verified working on a Fairphone 5 (Ubuntu Touch 24.04-1.x) with the Meshy
+app. Fine to use as a stopgap until Mir gets a proper Wayland text-input
+implementation — at that point this module becomes unnecessary.
+
 ## Status
 
-Working. Verified in two independent applications on a **Volla Phone Plinius**
-(`ansuz`), Ubuntu Touch 24.04.4, arm64:
+Work in progress. The GTK3 original is verified on Ubuntu Touch 24.04, arm64.
+The GTK4 port compiles; on-device verification is pending (Fairphone 5,
+Ubuntu Touch 24.04-1.x, arm64).
 
-- Firefox — typing, word suggestions, word replacement
-- a plain GTK3 app with an ordinary `GtkEntry` — typing, backspace, cursor
-  placement, selection
-
-Not tested on any other device or Ubuntu Touch version.
-
-Known gaps: `contentType` is always free text, so there are no email, number or
-URL keyboard layouts; selection and copy/paste callbacks are acknowledged but
-ignored; injected key events carry no modifier state.
+Known gaps carried over from the original: selection and copy/paste callbacks
+are acknowledged but ignored; injected key events carry no modifier state.
 
 ## Building
 
@@ -35,16 +41,25 @@ ignored; injected key events carry no modifier state.
 make                     # host build, for a quick syntax check
 ```
 
-For Ubuntu Touch you need an **aarch64** build. Any cross-toolchain with GTK3
+For Ubuntu Touch you need an **aarch64** build. Any cross-toolchain with GTK4
 arm64 development files works; a container is the least painful route:
 
 ```sh
 docker run --rm -v "$PWD:$PWD" -w "$PWD" \
   --platform linux/arm64 ubuntu:24.04 \
-  sh -c 'apt-get update && apt-get install -y build-essential libgtk-3-dev && make'
+  sh -c 'apt-get update && apt-get install -y build-essential libgtk-4-dev && make'
 ```
 
-The module depends only on **GTK3, GLib and GIO**.
+For repeated builds, build the image once and reuse it (based on the same
+container Clickable uses, so headers/ABI match the target exactly):
+
+```sh
+podman build -t im-maliit-builder -f Dockerfile.build .
+podman run --rm --platform linux/arm64 -v "$PWD:/work:Z" \
+  im-maliit-builder sh -c 'cd /work && make'
+```
+
+The module depends only on **GTK4, GLib and GIO**.
 
 ## Using it
 
@@ -61,9 +76,9 @@ export LD_LIBRARY_PATH="$APP_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 with an `immodules.cache` containing:
 
 ```
-# GTK+ Input Method Modules file
+# GTK4 Input Method Modules file
 "im-maliit.so"
-"maliit" "Maliit" "gtk30" "" ""
+"maliit" "Maliit" "gtk40" "" ""
 
 ```
 
@@ -77,18 +92,11 @@ Two things that are easy to get wrong here:
   `/{,var/}run/user/*/maliit-server`, so no policy changes and no extra
   `policy_groups` are needed.
 
-[ut-gtk3-app-template](https://github.com/TheSittingPenguin96/ut-gtk3-app-template)
-does all of this for you.
-
 ### System-wide
 
-```sh
-sudo make install
-sudo gtk-query-immodules-3.0 --update-cache
-```
-
 Ubuntu Touch's root filesystem is read-only, so this is for a distribution
-image or a rootfs you control — not a phone you are just using.
+image or a rootfs you control — not a phone you are just using. Click apps
+should ship the module inside the package; that is the supported path.
 
 ## Protocol
 

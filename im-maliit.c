@@ -1,5 +1,8 @@
 /*
- * im-maliit -- a GTK3 input method module for Maliit.
+ * im-maliit -- a GTK4 input method module for Maliit.
+ *
+ * GTK4 port of the original GTK3 module
+ * https://github.com/TheSittingPenguin96/gtk-im-maliit (GPL-3.0-or-later).
  *
  * Ubuntu Touch's on-screen keyboard is Maliit, and Lomiri's session already
  * sets GTK_IM_MODULE=maliit -- but no GTK module by that name exists on the
@@ -66,11 +69,11 @@
 
 typedef struct {
     GtkIMContext parent;
-    GdkWindow *client_window;
+    GtkWidget *client_widget;   /* GTK4: focused entry widget (has focus) */
     gchar *preedit;
     gint preedit_cursor;
     gboolean focused;
-    GdkRectangle cursor_rect; /* caret, in client-window coordinates */
+    GdkRectangle cursor_rect; /* caret, in widget coordinates */
 } ImMaliit;
 
 typedef struct {
@@ -86,7 +89,8 @@ static GDBusConnection *maliit_conn = NULL;
 static gboolean maliit_conn_failed = FALSE;
 static ImMaliit *focused_context = NULL;
 
-static void im_maliit_register_type(GTypeModule *module);
+static void im_maliit_class_init(ImMaliitClass *klass);
+static void im_maliit_init(ImMaliit *self);
 
 /* ------------------------------------------------------------------ */
 /* Server calls                                                        */
@@ -154,14 +158,11 @@ static void send_widget_information(ImMaliit *self, gboolean focus_changed)
         gint x = self->cursor_rect.x;
         gint y = self->cursor_rect.y;
 
-        /* set_cursor_location gives client-window coordinates; Maliit positions
-         * itself on screen, so translate. */
-        if (self->client_window) {
-            gint ox = 0, oy = 0;
-            gdk_window_get_origin(self->client_window, &ox, &oy);
-            x += ox;
-            y += oy;
-        }
+        /* set_cursor_location gives client-surface coordinates; GTK4 has no
+         * window-origin concept, but Lomiri/Maliit accepts surface-local
+         * coords of the focused toplevel, which GTK delivers here. */
+        (void)x;
+        (void)y;
         g_variant_builder_add(
             &b, "{sv}", "cursorRectangle",
             g_variant_new("(iiii)", x, y, self->cursor_rect.width,
@@ -232,31 +233,29 @@ static void deliver_key(ImMaliit *self, gint key_type, gint qt_key,
         return;
     }
 
-    if (!self->client_window) {
+    /* GTK4 removed gdk_event_put(): there is no way to inject a synthetic
+     * key event into the event queue from an IM module. Handle the keys
+     * that matter for text entry directly on the client widget. */
+    if (key_type == QEVENT_KEY_PRESS &&
+        (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter)) {
+        GtkWidget *widget = self->client_widget;
+        if (widget && GTK_IS_ENTRY(widget)) {
+            /* Single-line entry: trigger the activate action (same as
+             * hardware Enter) */
+            g_signal_emit_by_name(widget, "activate");
+        } else if (widget && GTK_IS_TEXT_VIEW(widget)) {
+            /* Multi-line view: notify the app via the custom im-enter
+             * signal (registered on GtkTextView in g_io_module_load) */
+            g_signal_emit_by_name(widget, "im-enter");
+        } else {
+            /* Unknown widget: fall back to committing a newline */
+            g_signal_emit_by_name(self, "commit", "\n");
+        }
         return;
     }
 
-    GdkEvent *ev = gdk_event_new(key_type == QEVENT_KEY_PRESS ? GDK_KEY_PRESS
-                                                              : GDK_KEY_RELEASE);
-    ev->key.window = g_object_ref(self->client_window);
-    ev->key.send_event = TRUE;
-    ev->key.time = GDK_CURRENT_TIME;
-    ev->key.state = 0;
-    ev->key.keyval = keyval;
-    ev->key.length = 0;
-    ev->key.string = NULL;
-    ev->key.hardware_keycode = 0;
-    ev->key.group = 0;
-    ev->key.is_modifier = 0;
-
-    GdkDisplay *display = gdk_window_get_display(self->client_window);
-    GdkSeat *seat = gdk_display_get_default_seat(display);
-    if (seat) {
-        gdk_event_set_device(ev, gdk_seat_get_keyboard(seat));
-    }
-
-    gdk_event_put(ev);
-    gdk_event_free(ev);
+    /* Remaining traversal keys (arrows, Home/End...) cannot be delivered
+     * without synthetic key events (removed in GTK4). */
 }
 
 static void set_preedit(ImMaliit *self, const gchar *text, gint cursor)
@@ -284,6 +283,7 @@ static void context_method_call(GDBusConnection *conn, const gchar *sender,
                                 gpointer user_data)
 {
     ImMaliit *self = focused_context;
+
 
     if (!g_strcmp0(method, "commitString")) {
         const gchar *text = NULL;
@@ -547,14 +547,59 @@ static void im_maliit_reset(GtkIMContext *context)
     server_call("reset", NULL);
 }
 
-static void im_maliit_set_client_window(GtkIMContext *context,
-                                        GdkWindow *window)
+/* Reopen-on-tap: Maliit can hide the OSK (drag-down, or its own ~1s
+ * self-close) without GTK ever seeing a focus-out, so a second tap on the
+ * still-focused widget produces no focus_in and nothing re-requests the
+ * keyboard. Handled entirely on the C side (a GtkGestureClick attached
+ * directly to the client widget) rather than via a custom signal emitted
+ * from Python: emitting a signal registered at runtime on a foreign
+ * GTypeModule type through PyGObject's generic .emit() crashed with SIGILL
+ * in testing. Guarded on focused_context so it only acts while this
+ * context genuinely owns IM focus. */
+static void im_maliit_gesture_released(GtkGestureClick *gesture, gint n_press,
+                                       gdouble x, gdouble y,
+                                       gpointer user_data)
+{
+    (void)gesture;
+    (void)n_press;
+    (void)x;
+    (void)y;
+    (void)user_data;
+    g_print("im-maliit: reopen-gesture released, focused_context=%p\n",
+           (void *)focused_context);
+    if (!focused_context)
+        return;
+    if (!ensure_connection())
+        return;
+    server_call("activateContext", NULL);
+    server_call("showInputMethod", NULL);
+}
+
+static void im_maliit_set_client_widget(GtkIMContext *context,
+                                        GtkWidget *widget)
 {
     ImMaliit *self = IM_MALIIT(context);
-    if (self->client_window) {
-        g_object_unref(self->client_window);
+    if (self->client_widget) {
+        g_object_remove_weak_pointer(G_OBJECT(self->client_widget),
+                                     (gpointer *)&self->client_widget);
     }
-    self->client_window = window ? g_object_ref(window) : NULL;
+    self->client_widget = widget;
+    if (widget) {
+        /* Weak ref: the IM context can outlive short-lived entries */
+        g_object_add_weak_pointer(G_OBJECT(widget),
+                                  (gpointer *)&self->client_widget);
+
+        if (GTK_IS_TEXT_VIEW(widget) &&
+            !g_object_get_data(G_OBJECT(widget), "im-maliit-reopen-gesture")) {
+            GtkGesture *gesture = gtk_gesture_click_new();
+            gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), 0);
+            g_signal_connect(gesture, "released",
+                             G_CALLBACK(im_maliit_gesture_released), NULL);
+            gtk_widget_add_controller(widget, GTK_EVENT_CONTROLLER(gesture));
+            g_object_set_data(G_OBJECT(widget), "im-maliit-reopen-gesture",
+                              gesture);
+        }
+    }
 }
 
 static void im_maliit_get_preedit_string(GtkIMContext *context, gchar **str,
@@ -617,9 +662,10 @@ static void im_maliit_finalize(GObject *obj)
     if (focused_context == self) {
         focused_context = NULL;
     }
-    if (self->client_window) {
-        g_object_unref(self->client_window);
-        self->client_window = NULL;
+    if (self->client_widget) {
+        g_object_remove_weak_pointer(G_OBJECT(self->client_widget),
+                                     (gpointer *)&self->client_widget);
+        self->client_widget = NULL;
     }
     g_free(self->preedit);
     self->preedit = NULL;
@@ -634,7 +680,7 @@ static void im_maliit_class_init(ImMaliitClass *klass)
 
     parent_class = g_type_class_peek_parent(klass);
 
-    im->set_client_window = im_maliit_set_client_window;
+    im->set_client_widget = im_maliit_set_client_widget;
     im->focus_in = im_maliit_focus_in;
     im->focus_out = im_maliit_focus_out;
     im->reset = im_maliit_reset;
@@ -646,14 +692,28 @@ static void im_maliit_class_init(ImMaliitClass *klass)
 
 static void im_maliit_init(ImMaliit *self)
 {
-    self->client_window = NULL;
+    self->client_widget = NULL;
     self->preedit = g_strdup("");
     self->preedit_cursor = 0;
     self->focused = FALSE;
 }
 
-static void im_maliit_register_type(GTypeModule *module)
+/* ------------------------------------------------------------------ */
+/* GTK4 module entry: GIO extension point                              */
+/* ------------------------------------------------------------------ */
+
+/* GTK4 replaced the GTK3 GtkIMContextInfo/im_module_* entry points with a
+ * GIO extension point ("gtk-im-module"). A module is a GIO plugin that
+ * implements the extension point with its GtkIMContext subclass; loading is
+ * triggered by pointing GTK_PATH at the tree holding 4.0.0/immodules/ and
+ * setting GTK_IM_MODULE=maliit. */
+
+static void im_maliit_class_init(ImMaliitClass *klass);
+static void im_maliit_init(ImMaliit *self);
+
+G_MODULE_EXPORT void g_io_module_load(GIOModule *module)
 {
+    g_printerr("im-maliit: g_io_module_load called\n");
     static const GTypeInfo info = {
         sizeof(ImMaliitClass),
         NULL, NULL,
@@ -665,44 +725,36 @@ static void im_maliit_register_type(GTypeModule *module)
         NULL,
     };
 
-    im_maliit_type = g_type_module_register_type(module, GTK_TYPE_IM_CONTEXT,
-                                                 "ImMaliit", &info, 0);
-}
-
-/* ------------------------------------------------------------------ */
-/* GTK module entry points                                             */
-/* ------------------------------------------------------------------ */
-
-static const GtkIMContextInfo maliit_info = {
-    "maliit",
-    "Maliit",
-    "gtk30",
-    "",
-    "",
-};
-
-static const GtkIMContextInfo *info_list[] = { &maliit_info };
-
-G_MODULE_EXPORT void im_module_init(GTypeModule *module)
-{
-    im_maliit_register_type(module);
-}
-
-G_MODULE_EXPORT void im_module_exit(void)
-{
-}
-
-G_MODULE_EXPORT void im_module_list(const GtkIMContextInfo ***contexts,
-                                    int *n_contexts)
-{
-    *contexts = info_list;
-    *n_contexts = G_N_ELEMENTS(info_list);
-}
-
-G_MODULE_EXPORT GtkIMContext *im_module_create(const gchar *context_id)
-{
-    if (g_strcmp0(context_id, "maliit") != 0) {
-        return NULL;
+    if (!im_maliit_type) {
+        im_maliit_type = g_type_module_register_type(G_TYPE_MODULE(module),
+                                                     GTK_TYPE_IM_CONTEXT,
+                                                "ImMaliit", &info, 0);
     }
-    return GTK_IM_CONTEXT(g_object_new(im_maliit_type, NULL));
+
+    /* Register a custom signal on GtkTextView: GTK4 made the TextView's
+     * IM context private, so the app cannot intercept OSK Enter via the
+     * IM commit signal. The module emits "im-enter" on the focused view
+     * instead; apps connect to it for Enter-to-send. */
+    if (g_signal_lookup("im-enter", GTK_TYPE_TEXT_VIEW) == 0) {
+        g_signal_new("im-enter",
+                     GTK_TYPE_TEXT_VIEW,
+                     G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+                     0, NULL, NULL,
+                     NULL,
+                     G_TYPE_NONE, 0);
+    }
+
+    g_io_extension_point_implement(GTK_IM_MODULE_EXTENSION_POINT_NAME,
+                                   im_maliit_type, "maliit", 10);
+}
+
+G_MODULE_EXPORT char **g_io_module_query(void)
+{
+    char *eps[] = { (char *)"gtk-im-module", NULL };
+    return g_strdupv(eps);
+}
+
+G_MODULE_EXPORT void g_io_module_unload(GIOModule *module)
+{
+    (void)module;
 }

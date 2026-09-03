@@ -1,0 +1,6 @@
+# Local build image: clickable's arm64-ut24.04-1.x-arm64 base plus the
+# GTK4 headers needed to compile im-maliit.c. Rebuild only when the base
+# image or these deps change:
+#   podman build -t im-maliit-builder -f Dockerfile.build .
+FROM docker.io/clickable/arm64-ut24.04-1.x-arm64
+RUN apt-get update -qq && apt-get install -y -qq libgtk-4-dev pkg-config && rm -rf /var/lib/apt/lists/*
