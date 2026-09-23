@@ -355,10 +355,24 @@ static void context_method_call(GDBusConnection *conn, const gchar *sender,
         return;
     }
 
+    if (!g_strcmp0(method, "updateInputMethodArea")) {
+        gint x, y, width, height;
+        g_variant_get(params, "(iiii)", &x, &y, &width, &height);
+        (void)x;
+        (void)y;
+        (void)width;
+        GtkWidget *widget = self ? self->client_widget : NULL;
+        if (widget && GTK_IS_TEXT_VIEW(widget)) {
+            g_signal_emit_by_name(widget, "im-keyboard-area-changed", height);
+        }
+        g_dbus_method_invocation_return_value(invocation, NULL);
+        return;
+    }
+
     /* activationLostEvent, setRedirectKeys, setDetectableAutoRepeat,
      * setGlobalCorrectionEnabled, setLanguage, setSelection,
-     * updateInputMethodArea, notifyExtendedAttributeChanged,
-     * pluginSettingsLoaded -- nothing to do, but still acknowledge. */
+     * notifyExtendedAttributeChanged, pluginSettingsLoaded -- nothing to
+     * do, but still acknowledge. */
     g_dbus_method_invocation_return_value(invocation, NULL);
 }
 
@@ -564,6 +578,13 @@ static void im_maliit_gesture_released(GtkGestureClick *gesture, gint n_press,
     (void)x;
     (void)y;
     (void)user_data;
+    /* Never claim this sequence: GtkTextView has its own internal click
+     * gesture that grabs real GTK focus and places the cursor. If ours
+     * claimed the sequence first, the text view's own gesture could be
+     * denied, leaving the widget looking focused to us but never actually
+     * receiving a proper focus grab / cursor placement from GTK's side -
+     * explicitly deny so we only ever observe, never intercept. */
+    gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_DENIED);
     if (!focused_context)
         return;
     if (!ensure_connection())
@@ -590,6 +611,11 @@ static void im_maliit_set_client_widget(GtkIMContext *context,
             !g_object_get_data(G_OBJECT(widget), "im-maliit-reopen-gesture")) {
             GtkGesture *gesture = gtk_gesture_click_new();
             gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), 0);
+            /* Capture phase + always-deny (see im_maliit_gesture_released):
+             * observe the tap without ever competing for the sequence claim
+             * against GtkTextView's own built-in click/focus/cursor gesture. */
+            gtk_event_controller_set_propagation_phase(
+                GTK_EVENT_CONTROLLER(gesture), GTK_PHASE_CAPTURE);
             g_signal_connect(gesture, "released",
                              G_CALLBACK(im_maliit_gesture_released), NULL);
             gtk_widget_add_controller(widget, GTK_EVENT_CONTROLLER(gesture));
@@ -736,6 +762,21 @@ G_MODULE_EXPORT void g_io_module_load(GIOModule *module)
                      0, NULL, NULL,
                      NULL,
                      G_TYPE_NONE, 0);
+    }
+
+    /* Maliit-server calls updateInputMethodArea(x, y, width, height) on us
+     * whenever the OSK's screen geometry changes (open, close, resize) -
+     * relayed here as one int (the panel height, 0 when hidden) so the app
+     * can reserve space above the keyboard instead of being covered by it
+     * (our surface itself is never resized by the compositor, unlike a
+     * native Ubuntu-SDK/QML app). */
+    if (g_signal_lookup("im-keyboard-area-changed", GTK_TYPE_TEXT_VIEW) == 0) {
+        g_signal_new("im-keyboard-area-changed",
+                     GTK_TYPE_TEXT_VIEW,
+                     G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+                     0, NULL, NULL,
+                     NULL,
+                     G_TYPE_NONE, 1, G_TYPE_INT);
     }
 
     g_io_extension_point_implement(GTK_IM_MODULE_EXTENSION_POINT_NAME,
